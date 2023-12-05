@@ -9,26 +9,7 @@
 #include <iostream>
 #include <omp.h>
 
-#define value_size 32
-#define use_literals_range true
-
-#if value_size == 8
-  typedef int8_t value_t;
-  const int max_exp = 3;
-  const int max_shift = 7;
-#elif value_size == 16
-  typedef int16_t value_t;
-  const int max_exp = 7;
-  const int max_shift = 15;
-#elif value_size == 32
-  typedef int32_t value_t;
-  const int max_exp = 15;
-  const int max_shift = 31;
-#elif value_size == 64
-  typedef int64_t value_t;
-  const int max_exp = 31;
-  const int max_shift = 63;
-#endif
+using value_t = int32_t;
 
 using Vec = std::valarray<value_t>;
 const value_t int_min = std::numeric_limits<value_t>::min();
@@ -50,6 +31,7 @@ const int max_length = 12;
 const int max_cache_length = max_length - 4;
 
 static const value_t literals[] = {};
+#define use_literals_range true
 #if use_literals_range == true
   const value_t min_literal = 1;
   const value_t max_literal = 10;
@@ -80,7 +62,7 @@ const bool ReuseVars = true;
 const bool UseAllVars = true;
 const bool AllowConsts = false; // Allow const exprs e.g: 3+2, x+3+2, 3-x-2 ...
 
-// ---- end of parameters ---
+// ---- end of parameters ----
 
 Vec py_mod(Vec a, Vec b) {
   return (a % b + b) % b;
@@ -171,8 +153,8 @@ void print_operator(Operator op) {
   }
 }
 
-int32_t operator_prec(Operator op) {
-  return static_cast<int32_t>(op) >> 4;
+int operator_prec(Operator op) {
+  return static_cast<int>(op) >> 4;
 }
 
 struct Expr {
@@ -182,7 +164,10 @@ struct Expr {
   Vec output;
   value_t literal;
   uint8_t var_mask;
-  int32_t prec() const { return operator_prec(op); }
+  int prec() const { return operator_prec(op); }
+  int used_vars() const { return std::bitset<num_vars>(var_mask).count(); }
+  int unused_vars() const { return num_vars - used_vars(); }
+  bool uses_all_vars() const { return unused_vars() == 0; }
 };
 
 void print_expression(const Expr *expr) {
@@ -245,47 +230,42 @@ int positive_integer_length(int k) {
   return l;
 }
 
+void validate_expression(const Expr& expr) {
+  if (UseAllVars && !expr.uses_all_vars()) return;
+  for (auto goal: goals) {
+    if ((expr.output == goal).min()) {
+      #pragma omp critical
+      {
+        print_expression(&expr);
+        puts("");
+      }
+    }
+  }
+}
+
 void find_expressions_left(const Expr &eR, int eR_length, int length);
 void find_expressions_right(const Expr &eL, int eL_length, int length);
 void cache_if_better(const Expr& expr, int length) {
-  // Don't cache if length > max cache length
-  if (length > max_cache_length) {
-    for (int target_length = length + 1; target_length <= max_length; target_length++) {
-      find_expressions_left(expr, length, target_length);
-      find_expressions_right(expr, length, target_length);
-    }
+  if (length == max_length || length == max_length - 1 && expr.prec() < 12) {
+    validate_expression(expr);
     return;
   }
-  #pragma omp critical
-  {
-    bool is_better = true;
-    auto el = cache[length].find(expr);
-    if (el != cache[length].end()) {
-      if (expr.prec() <= el->prec()) is_better = false;
-      else cache[length].erase(el);
-    }
-    if (is_better)
-      cache[length].insert(expr);
-  }
-}
 
-void validate_expression(const Expr& expr) {
-  for (auto goal: goals) {
-    if ((expr.output == goal).min()) {
-      print_expression(&expr);
-      puts("");
+  bool found_cached_output = false;
+  if (length - 1 <= max_cache_length) {
+    auto el = cache[length-1].find(expr);
+    if (el != cache[length-1].end()) {
+      found_cached_output = true;
+      if (expr.prec() <= el->prec())
+        return;
     }
   }
-}
-
-void add_expression(const Expr& expr, int length) {
-  const int unused_vars = num_vars - std::bitset<num_vars>(expr.var_mask).count();
 
   if (expr.left != nullptr && expr.right != nullptr) {
     if (!AllowConsts && (expr.output == expr.output[0]).min())
       return;
 
-    if (!ReuseVars && unused_vars == 0) {
+    if (!ReuseVars && expr.uses_all_vars()) {
       std::unordered_map<int, int> mp;
       for (int i = 0; i < expr.output.size(); i++) {
         const auto [it, emplaced] = mp.try_emplace(expr.output[i], goals[0][i]);
@@ -295,18 +275,31 @@ void add_expression(const Expr& expr, int length) {
     }
   }
 
-  if (!UseAllVars || unused_vars == 0) {
-    validate_expression(expr);
+  if (length > max_cache_length) {
+    if (!found_cached_output)
+      validate_expression(expr);
+    for (int target_length = length + 1; target_length <= max_length; target_length++) {
+      find_expressions_left(expr, length, target_length);
+      find_expressions_right(expr, length, target_length);
+    }
+    return;
   }
-  
-  if (length == max_length) return;
-  if (length == max_length-1 && expr.prec() < 12) return;
 
-  // check if there is a better Expr in cache[length-1] bc worth it
-  auto el = cache[length-1].find(expr);
-  if (el != cache[length-1].end() && expr.prec() <= el->prec()) return;
+  #pragma omp critical
+  {
+    bool is_better = true;
+    auto el = cache[length].find(expr);
+    if (el != cache[length].end()) {
+      found_cached_output = true;
+      if (expr.prec() <= el->prec()) is_better = false;
+      else cache[length].erase(el);
+    }
+    if (is_better)
+      cache[length].insert(expr);
+  }
 
-  cache_if_better(expr, length);
+  if (!found_cached_output)
+    validate_expression(expr);
 }
 
 bool can_apply_operator(const Expr& left, const Expr& right, Operator op) {
@@ -358,39 +351,39 @@ void find_1byte_operators(const Expr &eL, const Expr &eR, int length) {
     } else {
       z = 0*eL.output; z[eL.output < eR.output] = 1;
     }
-    add_expression(Expr{&eL, &eR, Operator::Lt, z, 0, mask}, length);
+    cache_if_better(Expr{&eL, &eR, Operator::Lt, z, 0, mask}, length);
   }
   if (Use_BitOr && eL.prec() >= 6 && eR.prec() > 6 && can_apply_operator(eL, eR, Operator::BitOr)) {
-    add_expression(Expr{&eL, &eR, Operator::BitOr, eL.output | eR.output, 0, mask}, length);
+    cache_if_better(Expr{&eL, &eR, Operator::BitOr, eL.output | eR.output, 0, mask}, length);
   }
   if (Use_BitXor && eL.prec() >= 7 && eR.prec() > 7 && can_apply_operator(eL, eR, Operator::BitXor)) {
-    add_expression(Expr{&eL, &eR, Operator::BitXor, eL.output ^ eR.output, 0, mask}, length);
+    cache_if_better(Expr{&eL, &eR, Operator::BitXor, eL.output ^ eR.output, 0, mask}, length);
   }
   if (Use_BitAnd && eL.prec() >= 8 && eR.prec() > 8 && can_apply_operator(eL, eR, Operator::BitAnd)) {
-    add_expression(Expr{&eL, &eR, Operator::BitAnd, eL.output & eR.output, 0, mask}, length);
+    cache_if_better(Expr{&eL, &eR, Operator::BitAnd, eL.output & eR.output, 0, mask}, length);
   }
   if (eL.prec() >= 10 && eR.prec() > 10) {
     if (Use_Add && can_apply_operator(eL, eR, Operator::Add))
-      add_expression(Expr{&eL, &eR, Operator::Add, eL.output + eR.output, 0, mask}, length);
+      cache_if_better(Expr{&eL, &eR, Operator::Add, eL.output + eR.output, 0, mask}, length);
     if (Use_Sub && can_apply_operator(eL, eR, Operator::Sub))
-      add_expression(Expr{&eL, &eR, Operator::Sub, eL.output - eR.output, 0, mask}, length);
+      cache_if_better(Expr{&eL, &eR, Operator::Sub, eL.output - eR.output, 0, mask}, length);
   }
   if (eL.prec() >= 11 && eR.prec() > 11) {
     if (Use_Mul && can_apply_operator(eL, eR, Operator::Mul))
-      add_expression(Expr{&eL, &eR, Operator::Mul, eL.output * eR.output, 0, mask}, length);
+      cache_if_better(Expr{&eL, &eR, Operator::Mul, eL.output * eR.output, 0, mask}, length);
     if ((eR.output != 0 && (eL.output != int_min || eR.output != -1)).min()) {
       if (CStyleMod) {
-        if (Use_Mod) add_expression(Expr{&eL, &eR, Operator::Mod, eL.output % eR.output, 0, mask}, length);
+        if (Use_Mod) cache_if_better(Expr{&eL, &eR, Operator::Mod, eL.output % eR.output, 0, mask}, length);
         if (Use_Div1 && can_apply_operator(eL, eR, Operator::Div1))
-          add_expression(Expr{&eL, &eR, Operator::Div1, eL.output / eR.output, 0, mask}, length);
+          cache_if_better(Expr{&eL, &eR, Operator::Div1, eL.output / eR.output, 0, mask}, length);
       } else {
         auto mod = py_mod(eL.output, eR.output);
-        if (Use_Mod) add_expression(Expr{&eL, &eR, Operator::Mod, mod, 0, mask}, length);
+        if (Use_Mod) cache_if_better(Expr{&eL, &eR, Operator::Mod, mod, 0, mask}, length);
         if (Use_Div1 && can_apply_operator(eL, eR, Operator::Div1))
-          add_expression(Expr{&eL, &eR, Operator::Div1, (eL.output - mod) / eR.output, 0, mask}, length);
+          cache_if_better(Expr{&eL, &eR, Operator::Div1, (eL.output - mod) / eR.output, 0, mask}, length);
       }
     }
-    if (Use_Gcd) add_expression(Expr{&eL, &eR, Operator::Gcd, gcd(eL.output, eR.output), 0, mask}, length);
+    if (Use_Gcd) cache_if_better(Expr{&eL, &eR, Operator::Gcd, gcd(eL.output, eR.output), 0, mask}, length);
   }
 }
 
@@ -403,7 +396,7 @@ void find_2byte_operators(const Expr &eL, const Expr &eR, int length) {
   if (eL.prec() >= 3 && eR.prec() > 3) {
     if (Use_Or && ok_before_keyword(&eL) && ok_after_keyword(&eR)) {
       z = 0*eL.output; z[eL.output == 0] = 1;
-      add_expression(Expr{&eL, &eR, Operator::Or, eL.output + eR.output * z, 0, mask}, length);
+      cache_if_better(Expr{&eL, &eR, Operator::Or, eL.output + eR.output * z, 0, mask}, length);
     }
   }
   if (Use_Leq && eL.prec() >= 5 && eR.prec() > 5) {
@@ -412,25 +405,28 @@ void find_2byte_operators(const Expr &eL, const Expr &eR, int length) {
     } else {
       z = 0*eL.output; z[eL.output <= eR.output] = 1;
     }
-    add_expression(Expr{&eL, &eR, Operator::Leq, z, 0, mask}, length);
+    cache_if_better(Expr{&eL, &eR, Operator::Leq, z, 0, mask}, length);
   }
-  if (eL.prec() >= 9 && eR.prec() > 9 && (eR.output >= 0).min() && (eR.output <= max_shift).min()) {
-    if (Use_BitShl) add_expression(Expr{&eL, &eR, Operator::BitShl, eL.output << eR.output, 0, mask}, length);
-    if (Use_BitShr) add_expression(Expr{&eL, &eR, Operator::BitShr, eL.output >> eR.output, 0, mask}, length);
+  if (eL.prec() >= 9 && eR.prec() > 9 && (eR.output >= 0).min() && (eR.output <= sizeof(value_t) * 8 - 1).min()) {
+    if (Use_BitShl) cache_if_better(Expr{&eL, &eR, Operator::BitShl, eL.output << eR.output, 0, mask}, length);
+    if (Use_BitShr) cache_if_better(Expr{&eL, &eR, Operator::BitShr, eL.output >> eR.output, 0, mask}, length);
   }
   if (eL.prec() >= 11 && eR.prec() > 11) {
     if ((eR.output != 0 && (eL.output != int_min || eR.output != -1)).min()) {
       if (CStyleMod) {
         if (Use_Div2 && can_apply_operator(eL, eR, Operator::Div2))
-          add_expression(Expr{&eL, &eR, Operator::Div2, eL.output / eR.output, 0, mask}, length);
+          cache_if_better(Expr{&eL, &eR, Operator::Div2, eL.output / eR.output, 0, mask}, length);
       } else {
         if (Use_Div2 && can_apply_operator(eL, eR, Operator::Div2))
-          add_expression(Expr{&eL, &eR, Operator::Div2, py_div(eL.output, eR.output), 0, mask}, length);
+          cache_if_better(Expr{&eL, &eR, Operator::Div2, py_div(eL.output, eR.output), 0, mask}, length);
       }
     }
   }
-  if (eL.prec() > 13 && eR.prec() >= 13 && (eR.output >= 0).min() && (eR.output <= max_exp).min()) {
-    if (Use_Exp) add_expression(Expr{&eL, &eR, Operator::Exp, ipow(eL.output, eR.output), 0, mask}, length);
+  if (
+    eL.prec() > 13 && eR.prec() >= 13 && (eR.output >= 0).min() &&
+    std::abs(eL.output).max() * std::log2(eR.output.max()) <= sizeof(value_t) * 8 - 1
+  ) {
+    if (Use_Exp) cache_if_better(Expr{&eL, &eR, Operator::Exp, ipow(eL.output, eR.output), 0, mask}, length);
   }
 }
 
@@ -445,9 +441,9 @@ void find_3byte_operators(const Expr &eL, const Expr &eR, int length) {
       z = 0*eL.output, z[eL.output == 0] = 1;
       z = eL.output + eR.output * z;
       if (!ok_before_keyword(&eL) && ok_after_keyword(&eR))
-        add_expression(Expr{&eL, &eR, Operator::SpaceOr, z, 0, mask}, length);
+        cache_if_better(Expr{&eL, &eR, Operator::SpaceOr, z, 0, mask}, length);
       else if (ok_before_keyword(&eL) && !ok_after_keyword(&eR))
-        add_expression(Expr{&eL, &eR, Operator::OrSpace, z, 0, mask}, length);;
+        cache_if_better(Expr{&eL, &eR, Operator::OrSpace, z, 0, mask}, length);;
     }
   }
 }
@@ -458,8 +454,8 @@ void find_expressions_left(const Expr &eR, int eR_length, int length) {
   if (missing_length == 1) {
     if (eR.prec() >= 12) {
       if (UseAllVars && !can_use_all_vars(eR.var_mask, length)) return;
-      if (Use_BitNeg && eR.op != Operator::BitNeg) add_expression(Expr{nullptr, &eR, Operator::BitNeg, ~eR.output, 0, eR.var_mask}, length);
-      if (Use_Neg && eR.op != Operator::Neg) add_expression(Expr{nullptr, &eR, Operator::Neg, -eR.output, 0, eR.var_mask}, length);
+      if (Use_BitNeg && eR.op != Operator::BitNeg) cache_if_better(Expr{nullptr, &eR, Operator::BitNeg, ~eR.output, 0, eR.var_mask}, length);
+      if (Use_Neg && eR.op != Operator::Neg) cache_if_better(Expr{nullptr, &eR, Operator::Neg, -eR.output, 0, eR.var_mask}, length);
     }
     return;
   }
@@ -521,10 +517,18 @@ void find_expressions(int length) {
         cache_if_better(Expr{nullptr, nullptr, Operator::Literal, 0 * goals[0] + l, l}, length);
     }
   #endif
-  #pragma omp parallel for
-  for (int eR_length = 1; eR_length < length; eR_length++) {
-    for (const auto &eR: cache[eR_length]) {
-      find_expressions_left(eR, eR_length, length);
+  #pragma omp parallel
+  {
+    #pragma omp single nowait
+    {
+      for (int eR_length = 1; eR_length < length; eR_length++) {
+        for (auto it = cache[eR_length].begin(); it != cache[eR_length].end(); ++it) {
+          #pragma omp task
+          {
+            find_expressions_left(*it, eR_length, length);
+          }
+        }
+      }
     }
   }
 }
