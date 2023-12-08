@@ -84,6 +84,13 @@ Vec ipow(Vec b, Vec e) {
   return r;
 }
 
+bool ipow_overflow(Vec b, Vec e) {
+  for (int i=0; i<b.size(); i++)
+    if (std::log2(std::abs(b[i])) * e[i] > sizeof(value_t) * 8 - 1)
+      return true;
+  return false;
+}
+
 Vec gcd(Vec a, Vec b) {
   Vec r = b;
   for (auto i=0; i<b.size(); i++) r[i] = std::gcd(a[i], b[i]);
@@ -422,10 +429,7 @@ void find_2byte_operators(const Expr &eL, const Expr &eR, int length) {
       }
     }
   }
-  if (
-    eL.prec() > 13 && eR.prec() >= 13 && (eR.output >= 0).min() &&
-    std::abs(eL.output).max() * std::log2(eR.output.max()) <= sizeof(value_t) * 8 - 1
-  ) {
+  if (eL.prec() > 13 && eR.prec() >= 13 && (eR.output >= 0).min() && !ipow_overflow(eL.output, eR.output)) {
     if (Use_Exp) cache_if_better(Expr{&eL, &eR, Operator::Exp, ipow(eL.output, eR.output), 0, mask}, length);
   }
 }
